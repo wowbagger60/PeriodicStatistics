@@ -1,51 +1,16 @@
 {
     "elements": [
         {
-            "type": "Select",
-            "name": "FirstDayOfWeek",
-            "caption": "First day of week",
-            "options": [
-                {
-                    "caption": "Sunday",
-                    "value": 0
-                },
-                {
-                    "caption": "Monday",
-                    "value": 1
-                },
-                {
-                    "caption": "Tuesday",
-                    "value": 2
-                },
-                {
-                    "caption": "Wednesday",
-                    "value": 3
-                },
-                {
-                    "caption": "Thursday",
-                    "value": 4
-                },
-                {
-                    "caption": "Friday",
-                    "value": 5
-                },
-                {
-                    "caption": "Saturday",
-                    "value": 6
-                }
-            ]
-        },
-        {
             "type": "NumberSpinner",
             "name": "RefreshInterval",
-            "caption": "Refresh interval for time-weighted averages",
+            "caption": "Refresh interval for time-weighted averages and integrals",
             "suffix": " min",
             "minimum": 0
         },
         {
             "type": "List",
             "name": "Variables",
-            "caption": "Variables",
+            "caption": "Variables (all values are always calculated; ticked values are also created as individual variables)",
             "rowCount": 10,
             "add": true,
             "delete": true,
@@ -60,26 +25,66 @@
                     }
                 },
                 {
-                    "name": "Average",
-                    "caption": "Average",
-                    "width": "160px",
-                    "add": "none",
+                    "name": "Min",
+                    "caption": "Min.",
+                    "width": "100px",
+                    "add": false,
                     "edit": {
-                        "type": "Select",
-                        "options": [
-                            {
-                                "caption": "None",
-                                "value": "none"
-                            },
-                            {
-                                "caption": "Arithmetic",
-                                "value": "arithmetic"
-                            },
-                            {
-                                "caption": "Time weighted",
-                                "value": "timeweighted"
-                            }
-                        ]
+                        "type": "CheckBox"
+                    }
+                },
+                {
+                    "name": "Max",
+                    "caption": "Max.",
+                    "width": "100px",
+                    "add": false,
+                    "edit": {
+                        "type": "CheckBox"
+                    }
+                },
+                {
+                    "name": "AvgArithmetic",
+                    "caption": "Avg. arithmetic",
+                    "width": "150px",
+                    "add": false,
+                    "edit": {
+                        "type": "CheckBox"
+                    }
+                },
+                {
+                    "name": "AvgTimeWeighted",
+                    "caption": "Avg. time-weighted",
+                    "width": "170px",
+                    "add": false,
+                    "edit": {
+                        "type": "CheckBox"
+                    }
+                },
+                {
+                    "name": "Delta",
+                    "caption": "Difference",
+                    "width": "120px",
+                    "add": false,
+                    "edit": {
+                        "type": "CheckBox"
+                    }
+                },
+                {
+                    "name": "Integral",
+                    "caption": "Integral",
+                    "width": "110px",
+                    "add": false,
+                    "edit": {
+                        "type": "CheckBox"
+                    }
+                },
+                {
+                    "name": "Timestamps",
+                    "caption": "Timestamps",
+                    "width": "130px",
+                    "add": false,
+                    "edit": {
+                        "type": "CheckBox"
                     }
                 }
             ]
@@ -87,8 +92,8 @@
         {
             "type": "List",
             "name": "TimeWindows",
-            "caption": "Custom time windows",
-            "rowCount": 6,
+            "caption": "Time windows",
+            "rowCount": 8,
             "add": true,
             "delete": true,
             "columns": [
@@ -166,8 +171,31 @@
                     "edit": {
                         "type": "CheckBox"
                     }
+                },
+                {
+                    "name": "Individual",
+                    "caption": "Individual variables",
+                    "width": "160px",
+                    "add": false,
+                    "edit": {
+                        "type": "CheckBox"
+                    }
                 }
             ]
+        },
+        {
+            "type": "Label",
+            "caption": "Deleting a time window permanently removes its statistics and individual variables. A deleted default window can be recreated with the same settings at any time, but starts empty."
+        },
+        {
+            "type": "CheckBox",
+            "name": "IndividualAlltime",
+            "caption": "Individual variables for Alltime"
+        },
+        {
+            "type": "Label",
+            "name": "IndividualCount",
+            "caption": "Individual variables currently created: %d"
         }
     ],
     "actions": [],

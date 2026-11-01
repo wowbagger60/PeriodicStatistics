@@ -9,9 +9,21 @@ class PeriodicStatistics extends IPSModuleStrict
     private const TIMER_REFRESH = 'Refresh';
     private const ARCHIVE_PAGE_SIZE = 5000;
     private const LOCK_TIMEOUT = 30000;
-    private const BUILTIN_PERIODS = ['Day', 'Week', 'Month', 'Year', 'Alltime'];
+    private const ALLTIME = 'Alltime';
     private const ARCHIVE_PROGRESS_FIELDS = ['processed', 'cursor', 'periods', 'next', 'newest', 'archiveSeen'];
     private const TIME_WINDOW_ID_PATTERN = '/^tw_[0-9a-f]{12}$/';
+    private const INDIVIDUAL_IDENT_PATTERN = '/^(\d+)_(.+)_(min|max|avga|avgt|delta|integral|mintime|maxtime)$/';
+    // Metric => [config column, caption]; timestamps follow their extreme.
+    private const INDIVIDUAL_METRICS = [
+        'min'      => ['Min', 'Minimum'],
+        'max'      => ['Max', 'Maximum'],
+        'avga'     => ['AvgArithmetic', 'Average (arithmetic)'],
+        'avgt'     => ['AvgTimeWeighted', 'Average (time-weighted)'],
+        'delta'    => ['Delta', 'Difference'],
+        'integral' => ['Integral', 'Integral'],
+        'mintime'  => ['Timestamps', 'Time of minimum'],
+        'maxtime'  => ['Timestamps', 'Time of maximum']
+    ];
 
     // Nesting depth of the instance lock within the current PHP call.
     private int $lockDepth = 0;
@@ -20,10 +32,10 @@ class PeriodicStatistics extends IPSModuleStrict
     {
         parent::Create();
 
-        $this->RegisterPropertyInteger('FirstDayOfWeek', 1);
         $this->RegisterPropertyInteger('RefreshInterval', 15);
         $this->RegisterPropertyString('Variables', '[]');
-        $this->RegisterPropertyString('TimeWindows', '[]');
+        $this->RegisterPropertyString('TimeWindows', json_encode($this->CreateDefaultTimeWindows()));
+        $this->RegisterPropertyBoolean('IndividualAlltime', false);
 
         $this->RegisterTimer(self::TIMER_ROLLOVER, 0, 'PERST_InternalTimer($_IPS[\'TARGET\']);');
         $this->RegisterTimer(self::TIMER_MERGE, 0, 'PERST_InternalMergeTimer($_IPS[\'TARGET\']);');
@@ -34,6 +46,7 @@ class PeriodicStatistics extends IPSModuleStrict
         $this->RegisterAttributeString('ConfigurationError', '');
         $this->RegisterAttributeString('MergeJobs', '{}');
         $this->RegisterAttributeString('MergeQueue', '[]');
+        $this->RegisterAttributeString('GeneratedNames', '{}');
     }
 
     public function ApplyChanges(): void
@@ -52,8 +65,18 @@ class PeriodicStatistics extends IPSModuleStrict
     public function GetConfigurationForm(): string
     {
         $form = json_decode(file_get_contents(__DIR__ . '/form.json'), true);
-        $error = $this->ReadConfigurationError();
 
+        // Shows the effect of the saved configuration; unsaved changes count after applying.
+        foreach ($form['elements'] as $index => $element) {
+            if (($element['name'] ?? '') === 'IndividualCount') {
+                $form['elements'][$index]['caption'] = sprintf(
+                    $this->Translate('Individual variables currently created: %d'),
+                    count($this->GetIndividualTargets())
+                );
+            }
+        }
+
+        $error = $this->ReadConfigurationError();
         if ($error !== '') {
             array_unshift($form['elements'], [
                 'type'    => 'Label',
@@ -88,14 +111,14 @@ class PeriodicStatistics extends IPSModuleStrict
         if ($VariableID !== 0) {
             $this->EnsureValidSourceVariable($VariableID);
             return isset($state[(string) $VariableID])
-                ? $this->CreatePublicData($state[(string) $VariableID], $VariableID)
+                ? $this->CreatePublicData($state[(string) $VariableID])
                 : [];
         }
 
         $result = [];
         foreach ($this->GetConfiguredVariableIDs() as $variableID) {
             if (isset($state[(string) $variableID])) {
-                $result[$variableID] = $this->CreatePublicData($state[(string) $variableID], $variableID);
+                $result[$variableID] = $this->CreatePublicData($state[(string) $variableID]);
             }
         }
         return $result;
@@ -113,7 +136,7 @@ class PeriodicStatistics extends IPSModuleStrict
             if (!isset($state[(string) $variableID])) {
                 continue;
             }
-            $data = $this->CreatePublicData($state[(string) $variableID], $variableID);
+            $data = $this->CreatePublicData($state[(string) $variableID]);
             if ($PeriodName !== '') {
                 foreach ($data as $name => $periodData) {
                     if (strcasecmp((string) $name, $PeriodName) === 0) {
@@ -138,13 +161,13 @@ class PeriodicStatistics extends IPSModuleStrict
         $this->ScheduleNextRollover();
     }
 
-    // Republishes time-weighted averages, which change with time even without new values.
+    // Republishes time-weighted averages and integrals, which change with time even without new values.
     public function InternalRefreshTimer(): void
     {
         $this->WithLock(function (): void {
             $state = $this->ReadState();
             foreach ($this->GetActiveVariableIDs() as $variableID) {
-                if ($this->GetAverageType($variableID) === 'timeweighted' && isset($state[(string) $variableID])) {
+                if (isset($state[(string) $variableID])) {
                     $this->PublishVariable($variableID, $state[(string) $variableID]);
                 }
             }
@@ -164,7 +187,7 @@ class PeriodicStatistics extends IPSModuleStrict
             throw new InvalidArgumentException('Unknown period: ' . $PeriodName);
         }
 
-        if (($period['kind'] ?? '') !== 'custom' || ($period['repeat'] ?? true)) {
+        if ($period['kind'] !== 'custom' || $period['repeat']) {
             $bounds = $this->GetPeriodBounds($period, $Timestamp);
             $currentBounds = $this->GetPeriodBounds($period, time());
             if ($bounds === null || $currentBounds === null || $bounds[0] !== $currentBounds[0]) {
@@ -196,33 +219,32 @@ class PeriodicStatistics extends IPSModuleStrict
         }
 
         $extreme = strtolower(trim($Extreme));
-        if (!in_array($extreme, ['', 'min', 'max', 'avg'], true)) {
-            throw new InvalidArgumentException('Extreme must be "min", "max", "avg" or empty.');
+        if (!in_array($extreme, ['', 'min', 'max', 'aggregates'], true)) {
+            throw new InvalidArgumentException('Extreme must be "min", "max", "aggregates" or empty.');
         }
 
         return $this->WithLock(function () use ($VariableID, $period, $extreme): bool {
             $state = $this->ReadState();
             $key = (string) $VariableID;
-            $name = $period['key'];
-            if (!isset($state[$key]['periods'][$name])) {
+            $periodKey = $period['key'];
+            if (!isset($state[$key]['periods'][$periodKey])) {
                 return false;
             }
 
-            $entry = &$state[$key]['periods'][$name];
+            $entry = &$state[$key]['periods'][$periodKey];
             if ($extreme === '' || $extreme === 'min') {
                 $entry['min'] = null;
             }
             if ($extreme === '' || $extreme === 'max') {
                 $entry['max'] = null;
             }
-            if ($extreme === '' || $extreme === 'avg') {
-                // A running period restarts its average with the current value; a completed one has none left.
-                $averageType = $this->GetAverageType($VariableID);
+            if ($extreme === '' || $extreme === 'aggregates') {
+                // A running period restarts averages, difference and integral with the current value;
+                // a completed one has none left.
                 $now = time();
-                $entry['averageType'] = $averageType;
-                $entry['average'] = (int) ($entry['periodEnd'] ?? 0) > $now
-                    ? $this->CreateAverageState($averageType, $this->NormalizeValue($VariableID, (float) GetValue($VariableID)), $now)
-                    : null;
+                $entry = array_merge($entry, (int) $entry['periodEnd'] > $now
+                    ? $this->CreateAggregates($this->NormalizeValue($VariableID, (float) GetValue($VariableID)), $now)
+                    : $this->CreateEmptyAggregates());
             }
             unset($entry);
 
@@ -366,8 +388,8 @@ class PeriodicStatistics extends IPSModuleStrict
         $variableIDs = $this->GetActiveVariableIDs();
         $this->RegisterVariableWatches($variableIDs);
         $this->WithLock(function () use ($variableIDs): void {
-            $this->SynchronizeOutputVariables();
             $this->SynchronizeCurrentValues($variableIDs);
+            $this->SynchronizeOutputVariables();
         });
         $this->ScheduleNextRollover();
         $this->UpdateRefreshTimer($variableIDs);
@@ -410,7 +432,7 @@ class PeriodicStatistics extends IPSModuleStrict
         });
     }
 
-    // A deleted source only disables its own statistics; output and state stay until its row is removed.
+    // A deleted source only disables its own statistics; outputs and state stay until its row is removed.
     private function HandleVariableDelete(int $variableID): void
     {
         @$this->UnregisterMessage($variableID, VM_UPDATE);
@@ -449,18 +471,15 @@ class PeriodicStatistics extends IPSModuleStrict
         foreach ($this->GetPeriodDefinitions() as $period) {
             $bounds = $this->GetPeriodBounds($period, $now);
             if ($bounds !== null) {
-                $periods[$period['key']] = $this->CreateArchivePeriod($bounds[0], min($bounds[1], $now), $bounds[1]);
-            } elseif (($period['kind'] ?? '') === 'custom' && !($period['repeat'] ?? true)) {
+                $periods[$period['key']] = $this->CreateArchivePeriod($bounds[0], $bounds[1]);
+            } elseif ($period['kind'] === 'custom' && !$period['repeat']) {
                 // A completed fixed window is also eligible for historical reconstruction.
-                $anchor = (new DateTimeImmutable('now'))->setDate($period['startYear'], $period['startMonth'], $period['startDay'])->setTime(0, 0);
+                $anchor = $this->GetCustomAnchor($period);
                 $end = $this->ShiftCustomBoundary($anchor, $period['type'], $period['duration'])->getTimestamp();
                 if ($anchor->getTimestamp() < $now) {
-                    $periods[$period['key']] = $this->CreateArchivePeriod($anchor->getTimestamp(), min($end, $now), $end);
+                    $periods[$period['key']] = $this->CreateArchivePeriod($anchor->getTimestamp(), $end);
                 }
             }
-        }
-        if (count($periods) === 0) {
-            throw new RuntimeException('No applicable periods.');
         }
         $start = min(array_column($periods, 'start'));
         $token = sprintf('%s-%s-%s-%s-%s', bin2hex(random_bytes(4)), bin2hex(random_bytes(2)),
@@ -481,16 +500,17 @@ class PeriodicStatistics extends IPSModuleStrict
         return $token;
     }
 
-    private function CreateArchivePeriod(int $start, int $end, int $periodEnd): array
+    // The period end may lie beyond the cutoff; weighting never extends past the cutoff.
+    private function CreateArchivePeriod(int $start, int $end): array
     {
-        return ['start' => $start, 'end' => $end, 'periodEnd' => $periodEnd,
+        return ['start' => $start, 'end' => $end,
             'min' => null, 'max' => null, 'sum' => 0.0, 'count' => 0, 'carry' => null,
-            'weightedSum' => 0.0, 'weightedTime' => 0, 'seeded' => false];
+            'weightedSum' => 0.0, 'weightedTime' => 0, 'delta' => 0.0, 'seeded' => false];
     }
 
     private function PublicJob(string $token, array $job): array
     {
-        return ['token' => $token, 'type' => $job['type'] ?? (($job['rebuild'] ?? false) ? 'rebuild' : 'merge'),
+        return ['token' => $token, 'type' => $job['type'],
             'status' => $job['status'], 'variable' => $job['variable'],
             'processed' => $job['processed'], 'message' => $job['message']];
     }
@@ -520,13 +540,19 @@ class PeriodicStatistics extends IPSModuleStrict
                 $signature = $t . ':' . sprintf('%.15g', $value);
                 $job['archiveSeen'][$signature] = ($job['archiveSeen'][$signature] ?? 0) + 1;
             }
+            $newer = $job['next'];
             foreach ($job['periods'] as &$period) {
                 // The next newer value defines the right edge of this sample's validity.
-                $right = min($period['end'], $job['next']['timestamp'] ?? $job['cutoff']);
+                $right = min($period['end'], $newer['timestamp'] ?? $job['cutoff']);
                 $left = max($period['start'], $t);
                 if ($right > $left) {
                     $period['weightedSum'] += $value * ($right - $left);
                     $period['weightedTime'] += $right - $left;
+                }
+                // The step to the next newer value belongs to the period of that value.
+                // A drop is a counter reset: the new value counts from zero.
+                if ($newer !== null && $newer['timestamp'] >= $period['start'] && $newer['timestamp'] < $period['end']) {
+                    $period['delta'] += $newer['value'] >= $value ? $newer['value'] - $value : $newer['value'];
                 }
                 if ($period['start'] !== 0 && $t <= $period['start'] && !$period['seeded']) {
                     // The newest value before the period start is valid at its beginning.
@@ -552,7 +578,7 @@ class PeriodicStatistics extends IPSModuleStrict
             return false;
         }
         // A rebuild must not erase valid statistics when no archive samples exist.
-        if (($job['rebuild'] ?? false) && $job['processed'] === 0) {
+        if ($job['rebuild'] && $job['processed'] === 0) {
             throw new RuntimeException('Archive contains no samples; rebuild was not committed.');
         }
         // The oldest available value carries back to the beginning of the period that contains it.
@@ -596,26 +622,23 @@ class PeriodicStatistics extends IPSModuleStrict
     {
         $variableID = (int) $job['variable'];
         $key = (string) $variableID;
-        $rebuild = (bool) ($job['rebuild'] ?? false);
+        $rebuild = (bool) $job['rebuild'];
         $cutoff = (int) $job['cutoff'];
-        $averageType = $this->GetAverageType($variableID);
         $definitions = $this->GetPeriodDefinitions();
         $state = $this->ReadState();
         $variableState = $state[$key] ?? ['periods' => []];
         $newestValue = isset($job['newest']) ? (float) $job['newest']['value'] : (float) GetValue($variableID);
-        $averageReplaced = [];
+        $aggregatesReplaced = [];
 
-        foreach ($job['periods'] as $name => $archive) {
-            $entry = $variableState['periods'][$name] ?? null;
+        foreach ($job['periods'] as $periodKey => $archive) {
+            $entry = $variableState['periods'][$periodKey] ?? null;
             if ($entry === null) {
                 if ($archive['min'] === null) {
                     continue;
                 }
                 // Completed, non-repeating custom periods have no live initialization.
-                $entry = [
-                    'periodStart' => $archive['start'], 'periodEnd' => $archive['periodEnd'] ?? $archive['end'],
-                    'min' => null, 'max' => null, 'averageType' => $averageType, 'average' => null
-                ];
+                $entry = ['periodStart' => $archive['start'], 'periodEnd' => $archive['end'], 'min' => null, 'max' => null]
+                    + $this->CreateEmptyAggregates();
             }
             if ((int) $entry['periodStart'] !== (int) $archive['start']) {
                 continue; // Do not overwrite a period that rolled over during import.
@@ -636,18 +659,23 @@ class PeriodicStatistics extends IPSModuleStrict
                 }
             }
 
-            // An archive-derived average replaces the live one. Without archive data, a rebuild
-            // carries the newest value forward in a running period and leaves a completed one empty.
-            $average = $this->CreateArchiveAverage($averageType, $archive, $newestValue, $cutoff);
-            if ($average === null && $rebuild && (int) ($archive['periodEnd'] ?? $archive['end']) > $cutoff) {
-                $average = $this->CreateAverageState($averageType, $newestValue, $cutoff);
+            // Archive-derived averages, difference and integral replace the live ones. Without archive
+            // data, a rebuild starts a running period with the newest value and leaves a completed one empty.
+            if ($archive['count'] > 0 || $archive['carry'] !== null) {
+                $entry['arithmetic'] = ['sum' => (float) $archive['sum'], 'count' => (int) $archive['count'], 'carry' => $archive['carry']];
+                $entry['timeweighted'] = $archive['weightedTime'] > 0
+                    ? ['weightedSum' => (float) $archive['weightedSum'], 'weightedTime' => (int) $archive['weightedTime'],
+                        'lastValue' => $newestValue, 'lastTimestamp' => $cutoff]
+                    : $this->CreateAggregates($newestValue, $cutoff)['timeweighted'];
+                $entry['delta'] = (float) $archive['delta'];
+                $aggregatesReplaced[$periodKey] = true;
+            } elseif ($rebuild) {
+                $entry = array_merge($entry, (int) $archive['end'] > $cutoff
+                    ? $this->CreateAggregates($newestValue, $cutoff)
+                    : $this->CreateEmptyAggregates());
+                $aggregatesReplaced[$periodKey] = true;
             }
-            if ($average !== null || $rebuild) {
-                $entry['averageType'] = $averageType;
-                $entry['average'] = $average;
-                $averageReplaced[$name] = true;
-            }
-            $variableState['periods'][$name] = $entry;
+            $variableState['periods'][$periodKey] = $entry;
         }
 
         // The newest archived value is valid at the cutoff.
@@ -673,20 +701,20 @@ class PeriodicStatistics extends IPSModuleStrict
                 $this->RememberLastValue($variableState, $variableID, $value, $timestamp);
                 continue;
             }
-            // A merge processed live updates already. Extremes are idempotent; averages
-            // need the samples again only where the archive replaced them.
+            // A merge processed live updates already. Extremes are idempotent; the other
+            // values need the samples again only where the archive replaced them.
             $normalized = $this->NormalizeValue($variableID, $value);
             foreach ($definitions as $definition) {
-                $name = $definition['key'];
+                $periodKey = $definition['key'];
                 $bounds = $this->GetPeriodBounds($definition, $timestamp);
-                if ($bounds === null || !isset($variableState['periods'][$name])
-                    || (int) $variableState['periods'][$name]['periodStart'] !== $bounds[0]) {
+                if ($bounds === null || !isset($variableState['periods'][$periodKey])
+                    || (int) $variableState['periods'][$periodKey]['periodStart'] !== $bounds[0]) {
                     continue;
                 }
-                if (isset($averageReplaced[$name])) {
-                    $this->UpdatePeriodEntry($variableState['periods'][$name], $averageType, $normalized, $timestamp);
+                if (isset($aggregatesReplaced[$periodKey])) {
+                    $this->UpdatePeriodEntry($variableState['periods'][$periodKey], $normalized, $timestamp);
                 } else {
-                    $this->UpdateExtremes($variableState['periods'][$name], $normalized, $timestamp);
+                    $this->UpdateExtremes($variableState['periods'][$periodKey], $normalized, $timestamp);
                 }
             }
         }
@@ -704,18 +732,6 @@ class PeriodicStatistics extends IPSModuleStrict
         $this->PublishVariable($variableID, $variableState);
     }
 
-    private function CreateArchiveAverage(string $type, array $archive, float $lastValue, int $cutoff): ?array
-    {
-        if ($type === 'arithmetic' && ($archive['count'] > 0 || ($archive['carry'] ?? null) !== null)) {
-            return ['sum' => (float) $archive['sum'], 'count' => (int) $archive['count'], 'carry' => $archive['carry'] ?? null];
-        }
-        if ($type === 'timeweighted' && $archive['weightedTime'] > 0) {
-            return ['weightedSum' => (float) $archive['weightedSum'], 'weightedTime' => (int) $archive['weightedTime'],
-                'lastValue' => $lastValue, 'lastTimestamp' => $cutoff];
-        }
-        return null;
-    }
-
     // Returns true if a rebuild owns the live update; merge jobs only copy it.
     private function RecordMergeLiveValue(int $variableID, float $value, int $timestamp): bool
     {
@@ -726,7 +742,7 @@ class PeriodicStatistics extends IPSModuleStrict
             if ((int) $job['variable'] !== $variableID || !in_array($job['status'], ['queued', 'running'], true)) {
                 continue;
             }
-            if ($job['rebuild'] ?? false) {
+            if ($job['rebuild']) {
                 $blocked = true;
             }
             if ($timestamp >= $job['cutoff']) {
@@ -745,7 +761,7 @@ class PeriodicStatistics extends IPSModuleStrict
     {
         $blocked = [];
         foreach ($this->ReadMergeJobs() as $job) {
-            if (($job['rebuild'] ?? false) && in_array($job['status'], ['queued', 'running'], true)) {
+            if ($job['rebuild'] && in_array($job['status'], ['queued', 'running'], true)) {
                 $blocked[(int) $job['variable']] = true;
             }
         }
@@ -755,7 +771,7 @@ class PeriodicStatistics extends IPSModuleStrict
     private function ReplayFailedRebuild(array $job): void
     {
         $variableID = (int) $job['variable'];
-        if (!($job['rebuild'] ?? false) || count($job['live'] ?? []) === 0 || !IPS_VariableExists($variableID)) {
+        if (!$job['rebuild'] || count($job['live']) === 0 || !IPS_VariableExists($variableID)) {
             return;
         }
         $live = $job['live'];
@@ -851,11 +867,6 @@ class PeriodicStatistics extends IPSModuleStrict
     // Returns null for a valid configuration. A missing variable is not fatal: the others keep running.
     private function ValidateConfiguration(): ?array
     {
-        $firstDay = $this->ReadPropertyInteger('FirstDayOfWeek');
-        if ($firstDay < 0 || $firstDay > 6) {
-            return $this->CreateError('First day of week is invalid.', true);
-        }
-
         if ($this->ReadPropertyInteger('RefreshInterval') < 0) {
             return $this->CreateError('The refresh interval is invalid.', true);
         }
@@ -883,24 +894,18 @@ class PeriodicStatistics extends IPSModuleStrict
             if (!in_array($variable['VariableType'], [VARIABLETYPE_INTEGER, VARIABLETYPE_FLOAT], true)) {
                 return $this->CreateError('Only integer and float variables can be used.', true);
             }
-
-            $average = strtolower((string) ($row['Average'] ?? 'none'));
-            if (!in_array($average, ['none', 'arithmetic', 'timeweighted'], true)) {
-                return $this->CreateError('The configured average type is invalid.', true);
-            }
         }
 
-        $reserved = array_fill_keys(array_map('strtolower', self::BUILTIN_PERIODS), true);
-        $seenNames = $reserved;
+        $seenNames = [strtolower(self::ALLTIME) => true];
         foreach ($this->GetCustomPeriodDefinitions() as $period) {
-            $name = trim((string) ($period['name'] ?? ''));
+            $name = $period['name'];
             if ($name === '') {
-                return $this->CreateError('A custom time window has no name.', true);
+                return $this->CreateError('A time window has no name.', true);
             }
 
             $lowerName = strtolower($name);
             if (isset($seenNames[$lowerName])) {
-                return $this->CreateError('Time window names must be unique and must not use a standard name.', true);
+                return $this->CreateError('Time window names must be unique and must not be "Alltime".', true);
             }
             $seenNames[$lowerName] = true;
 
@@ -958,46 +963,18 @@ class PeriodicStatistics extends IPSModuleStrict
         return $result;
     }
 
+    // The configured time windows followed by Alltime, which is always recorded.
     private function GetPeriodDefinitions(): array
     {
-        $periods = [
-            [
-                'key' => 'Day',
-                'name' => 'Day',
-                'kind' => 'builtin',
-                'type' => 'daily'
-            ],
-            [
-                'key' => 'Week',
-                'name' => 'Week',
-                'kind' => 'builtin',
-                'type' => 'weekly',
-                'weekday' => $this->ReadPropertyInteger('FirstDayOfWeek')
-            ],
-            [
-                'key' => 'Month',
-                'name' => 'Month',
-                'kind' => 'builtin',
-                'type' => 'monthly'
-            ],
-            [
-                'key' => 'Year',
-                'name' => 'Year',
-                'kind' => 'builtin',
-                'type' => 'yearly'
-            ],
-            [
-                'key' => 'Alltime',
-                'name' => 'Alltime',
-                'kind' => 'builtin',
-                'type' => 'alltime'
-            ]
+        $periods = $this->GetCustomPeriodDefinitions();
+        $periods[] = [
+            'key' => self::ALLTIME,
+            'name' => self::ALLTIME,
+            'kind' => 'alltime',
+            'type' => 'alltime',
+            'repeat' => false,
+            'individual' => $this->ReadPropertyBoolean('IndividualAlltime')
         ];
-
-        foreach ($this->GetCustomPeriodDefinitions() as $period) {
-            $periods[] = $period;
-        }
-
         return $periods;
     }
 
@@ -1017,17 +994,18 @@ class PeriodicStatistics extends IPSModuleStrict
             }
 
             // Statistics are keyed by the stable window ID, so renaming keeps them.
-            // Rows from earlier builds use their name until EnsureTimeWindowIDs assigns an ID.
+            // A new row uses its name until EnsureTimeWindowIDs assigns an ID.
             $name = trim((string) ($row['Name'] ?? ''));
             $id = (string) ($row['ID'] ?? '');
             $periods[] = [
-                'key'      => preg_match(self::TIME_WINDOW_ID_PATTERN, $id) === 1 ? $id : $name,
-                'name'     => $name,
-                'kind'     => 'custom',
-                'type'     => strtolower((string) ($row['Unit'] ?? '')),
-                'duration' => (int) ($row['Duration'] ?? 1),
-                'repeat'   => (bool) ($row['Repeat'] ?? true),
-                'startDay' => (int) ($date['day'] ?? 0),
+                'key'        => preg_match(self::TIME_WINDOW_ID_PATTERN, $id) === 1 ? $id : $name,
+                'name'       => $name,
+                'kind'       => 'custom',
+                'type'       => strtolower((string) ($row['Unit'] ?? '')),
+                'duration'   => (int) ($row['Duration'] ?? 1),
+                'repeat'     => (bool) ($row['Repeat'] ?? true),
+                'individual' => (bool) ($row['Individual'] ?? false),
+                'startDay'   => (int) ($date['day'] ?? 0),
                 'startMonth' => (int) ($date['month'] ?? 0),
                 'startYear'  => (int) ($date['year'] ?? 0)
             ];
@@ -1036,8 +1014,29 @@ class PeriodicStatistics extends IPSModuleStrict
         return $periods;
     }
 
-    // Gives every time window a unique, immutable ID and moves statistics of earlier builds
-    // from the window name to that ID. Returns true if the configuration was rewritten.
+    // The calendar periods as ordinary time windows. 1970 starts a decade; 1970-01-05 was a Monday.
+    private function CreateDefaultTimeWindows(): array
+    {
+        $window = function (string $name, int $day, int $duration, string $unit): array {
+            return [
+                'Name' => $this->Translate($name),
+                'Start' => json_encode(['year' => 1970, 'month' => 1, 'day' => $day]),
+                'Duration' => $duration,
+                'Unit' => $unit,
+                'Repeat' => true,
+                'Individual' => false
+            ];
+        };
+        return [
+            $window('Day', 1, 1, 'day'),
+            $window('Week', 5, 1, 'week'),
+            $window('Month', 1, 1, 'month'),
+            $window('Year', 1, 1, 'year'),
+            $window('Decade', 1, 10, 'year')
+        ];
+    }
+
+    // Gives every time window a unique, immutable ID. Returns true if the configuration was rewritten.
     private function EnsureTimeWindowIDs(): bool
     {
         $rows = json_decode($this->ReadPropertyString('TimeWindows'), true);
@@ -1046,37 +1045,20 @@ class PeriodicStatistics extends IPSModuleStrict
         }
 
         $seen = [];
-        $assigned = [];
+        $changed = false;
         foreach ($rows as &$row) {
             $id = (string) ($row['ID'] ?? '');
             if (preg_match(self::TIME_WINDOW_ID_PATTERN, $id) !== 1 || isset($seen[$id])) {
                 $id = 'tw_' . bin2hex(random_bytes(6));
                 $row['ID'] = $id;
-                // A list of pairs: names such as "2026" would turn into integer array keys.
-                $assigned[] = ['name' => trim((string) ($row['Name'] ?? '')), 'id' => $id];
+                $changed = true;
             }
             $seen[$id] = true;
         }
         unset($row);
-        if (count($assigned) === 0) {
+        if (!$changed) {
             return false;
         }
-
-        $builtin = array_map('strtolower', self::BUILTIN_PERIODS);
-        $this->WithLock(function () use ($assigned, $builtin): void {
-            $state = $this->ReadState();
-            foreach ($state as &$variableState) {
-                foreach ($assigned as ['name' => $name, 'id' => $id]) {
-                    if ($name === '' || in_array(strtolower($name), $builtin, true) || !isset($variableState['periods'][$name])) {
-                        continue;
-                    }
-                    $variableState['periods'][$id] = $variableState['periods'][$name];
-                    unset($variableState['periods'][$name]);
-                }
-            }
-            unset($variableState);
-            $this->WriteState($state);
-        });
 
         IPS_SetProperty($this->InstanceID, 'TimeWindows', json_encode($rows));
         IPS_ApplyChanges($this->InstanceID);
@@ -1085,24 +1067,13 @@ class PeriodicStatistics extends IPSModuleStrict
 
     private function IsValidPeriodDefinition(array $period): bool
     {
-        if (($period['kind'] ?? '') !== 'custom') {
-            return false;
-        }
         if (!in_array($period['type'], ['day', 'week', 'month', 'year'], true)) {
             return false;
         }
-        if (($period['duration'] ?? 0) < 1) {
+        if ($period['duration'] < 1) {
             return false;
         }
-
-        $day = (int) ($period['startDay'] ?? 0);
-        $month = (int) ($period['startMonth'] ?? 0);
-        $year = (int) ($period['startYear'] ?? 0);
-        if (!checkdate($month, $day, $year)) {
-            return false;
-        }
-
-        return true;
+        return checkdate($period['startMonth'], $period['startDay'], $period['startYear']);
     }
 
     private function GetPeriodDefinition(string $name): ?array
@@ -1128,20 +1099,155 @@ class PeriodicStatistics extends IPSModuleStrict
 
             $ident = $this->GetOutputIdent($variableID);
             $this->RegisterVariableString($ident, IPS_GetName($variableID) . ' - PeriodicStatistics');
-
-            if (isset($state[(string) $variableID])) {
-                $this->PublishVariable($variableID, $state[(string) $variableID]);
-            }
         }
+
+        $individual = $this->SynchronizeIndividualVariables();
 
         foreach (IPS_GetChildrenIDs($this->InstanceID) as $childID) {
             $ident = IPS_GetObject($childID)['ObjectIdent'];
             if (ctype_digit($ident) && !isset($wanted[(int) $ident])) {
                 $this->UnregisterVariable($ident);
+            } elseif (preg_match(self::INDIVIDUAL_IDENT_PATTERN, $ident, $match) === 1 && !isset($individual[$ident])
+                && (!isset($wanted[(int) $match[1]]) || IPS_VariableExists((int) $match[1]))) {
+                // Individual variables of a deleted source stay, like its JSON output.
+                $this->UnregisterVariable($ident);
             }
         }
 
         $this->PruneState(array_keys($wanted), array_column($this->GetPeriodDefinitions(), 'key'));
+
+        $state = $this->ReadState();
+        foreach (array_keys($wanted) as $variableID) {
+            if (IPS_VariableExists($variableID) && isset($state[(string) $variableID])) {
+                $this->PublishVariable($variableID, $state[(string) $variableID]);
+            }
+        }
+    }
+
+    // Creates the selected individual variables and returns them keyed by ident.
+    private function SynchronizeIndividualVariables(): array
+    {
+        $generatedNames = json_decode($this->ReadAttributeString('GeneratedNames'), true);
+        $generatedNames = is_array($generatedNames) ? $generatedNames : [];
+        $targets = $this->GetIndividualTargets();
+        foreach ($targets as $ident => $target) {
+            $name = IPS_GetName($target['variable']) . ' - ' . $target['periodCaption'] . ' ' . $this->Translate(self::INDIVIDUAL_METRICS[$target['metric']][1]);
+            $objectID = @$this->GetIDForIdent($ident);
+            if ($objectID !== false && IPS_GetVariable($objectID)['VariableType'] !== $target['type']) {
+                // The source type changed; recreate with the matching type.
+                $this->UnregisterVariable($ident);
+                $objectID = false;
+            }
+            if ($objectID === false) {
+                if ($target['type'] === VARIABLETYPE_FLOAT) {
+                    $this->RegisterVariableFloat($ident, $name, '', $target['position']);
+                } else {
+                    $this->RegisterVariableInteger($ident, $name, '', $target['position']);
+                }
+                $this->ApplyIndividualPresentation($target, $this->GetIDForIdent($ident));
+                $generatedNames[$ident] = $name;
+            } elseif (($generatedNames[$ident] ?? IPS_GetName($objectID)) === IPS_GetName($objectID)) {
+                // Follow renamed sources and periods, unless the user renamed the variable.
+                if (IPS_GetName($objectID) !== $name) {
+                    IPS_SetName($objectID, $name);
+                }
+                $generatedNames[$ident] = $name;
+            }
+        }
+        $this->WriteAttributeString('GeneratedNames', json_encode(array_intersect_key($generatedNames, $targets), JSON_UNESCAPED_UNICODE));
+        return $targets;
+    }
+
+    // Returns the individual variables the configuration asks for, keyed by ident.
+    private function GetIndividualTargets(int $onlyVariableID = 0): array
+    {
+        $definitions = [];
+        foreach ($this->GetPeriodDefinitions() as $index => $period) {
+            if ($period['individual']) {
+                $definitions[] = $period + ['index' => $index];
+            }
+        }
+
+        $targets = [];
+        foreach ($this->GetConfiguredVariables() as $variableIndex => $row) {
+            $variableID = (int) ($row['Variable'] ?? 0);
+            if (($onlyVariableID !== 0 && $variableID !== $onlyVariableID) || $variableID <= 0 || !IPS_VariableExists($variableID)) {
+                continue;
+            }
+            $sourceType = IPS_GetVariable($variableID)['VariableType'];
+            if (!in_array($sourceType, [VARIABLETYPE_INTEGER, VARIABLETYPE_FLOAT], true)) {
+                continue;
+            }
+            $types = [
+                'min' => $sourceType, 'max' => $sourceType, 'avga' => VARIABLETYPE_FLOAT, 'avgt' => VARIABLETYPE_FLOAT,
+                'delta' => $sourceType, 'integral' => VARIABLETYPE_FLOAT,
+                'mintime' => VARIABLETYPE_INTEGER, 'maxtime' => VARIABLETYPE_INTEGER
+            ];
+            $metrics = [];
+            foreach (self::INDIVIDUAL_METRICS as $metric => [$column]) {
+                if ($row[$column] ?? false) {
+                    $metrics[$metric] = $types[$metric];
+                }
+            }
+            // Timestamps only accompany a selected extreme.
+            if (!isset($metrics['min'])) {
+                unset($metrics['mintime']);
+            }
+            if (!isset($metrics['max'])) {
+                unset($metrics['maxtime']);
+            }
+            foreach ($definitions as $period) {
+                $metricIndex = 0;
+                foreach ($metrics as $metric => $type) {
+                    $ident = $variableID . '_' . $period['key'] . '_' . $metric;
+                    $targets[$ident] = [
+                        'variable' => $variableID,
+                        'periodKey' => $period['key'],
+                        'periodCaption' => $period['kind'] === 'custom' ? $period['name'] : $this->Translate($period['name']),
+                        'metric' => $metric,
+                        'type' => $type,
+                        'position' => ($variableIndex + 1) * 1000 + $period['index'] * 10 + $metricIndex++
+                    ];
+                }
+            }
+        }
+        return $targets;
+    }
+
+    // Copies the source presentation to a new individual variable; timestamps show date and time.
+    // The integral has a different unit (value × hours) and stays without presentation.
+    private function ApplyIndividualPresentation(array $target, int $objectID): void
+    {
+        if (in_array($target['metric'], ['mintime', 'maxtime'], true)) {
+            if (IPS_VariableProfileExists('~UnixTimestamp')) {
+                IPS_SetVariableCustomProfile($objectID, '~UnixTimestamp');
+            }
+            return;
+        }
+        if ($target['metric'] === 'integral') {
+            return;
+        }
+
+        $source = IPS_GetVariable($target['variable']);
+        foreach (['VariableCustomPresentation', 'VariablePresentation'] as $field) {
+            $presentation = $source[$field] ?? [];
+            if (is_string($presentation)) {
+                $presentation = json_decode($presentation, true);
+            }
+            if (is_array($presentation) && count($presentation) > 0) {
+                IPS_SetVariableCustomPresentation($objectID, $presentation);
+                return;
+            }
+        }
+        foreach (['VariableCustomProfile', 'VariableProfile'] as $field) {
+            $profile = (string) ($source[$field] ?? '');
+            // A profile only fits a variable of its own type, e.g. not an integer profile on a float average.
+            if ($profile !== '' && IPS_VariableProfileExists($profile)
+                && IPS_GetVariableProfile($profile)['ProfileType'] === $target['type']) {
+                IPS_SetVariableCustomProfile($objectID, $profile);
+                return;
+            }
+        }
     }
 
     private function RegisterVariableWatches(array $variableIDs): void
@@ -1175,18 +1281,11 @@ class PeriodicStatistics extends IPSModuleStrict
 
     private function UpdateRefreshTimer(array $variableIDs): void
     {
-        $needed = false;
-        foreach ($variableIDs as $variableID) {
-            if ($this->GetAverageType($variableID) === 'timeweighted') {
-                $needed = true;
-                break;
-            }
-        }
         $minutes = $this->ReadPropertyInteger('RefreshInterval');
-        $this->SetTimerInterval(self::TIMER_REFRESH, $needed && $minutes > 0 ? $minutes * 60000 : 0);
+        $this->SetTimerInterval(self::TIMER_REFRESH, count($variableIDs) > 0 && $minutes > 0 ? $minutes * 60000 : 0);
     }
 
-    // Starts periods that rolled over and applies changed average types. Must run under the lock.
+    // Starts periods that rolled over. Must run under the lock.
     private function SynchronizeCurrentValues(array $variableIDs): void
     {
         $now = time();
@@ -1221,7 +1320,6 @@ class PeriodicStatistics extends IPSModuleStrict
 
     private function EnsureCurrentPeriods(array &$variableState, int $variableID, array $definitions, float $currentValue, int $now): bool
     {
-        $averageType = $this->GetAverageType($variableID);
         $currentValue = $this->NormalizeValue($variableID, $currentValue);
         // The value valid at a period boundary is the last observed one; without history it is the current value.
         $carry = $variableState['last']['value'] ?? $currentValue;
@@ -1231,16 +1329,12 @@ class PeriodicStatistics extends IPSModuleStrict
             if ($bounds === null) {
                 continue;
             }
-            $name = $period['key'];
-            $entry = $variableState['periods'][$name] ?? null;
+            $periodKey = $period['key'];
+            $entry = $variableState['periods'][$periodKey] ?? null;
             if (!is_array($entry) || (int) ($entry['periodStart'] ?? -1) !== $bounds[0]) {
-                $variableState['periods'][$name] = $period['type'] === 'alltime'
-                    ? $this->CreatePeriodEntry($bounds, $currentValue, $now, $averageType)
-                    : $this->CreatePeriodEntry($bounds, $carry, $bounds[0], $averageType);
-                $changed = true;
-            } elseif (($entry['averageType'] ?? 'none') !== $averageType) {
-                $variableState['periods'][$name]['averageType'] = $averageType;
-                $variableState['periods'][$name]['average'] = $this->CreateAverageState($averageType, $currentValue, $now);
+                $variableState['periods'][$periodKey] = $period['type'] === 'alltime'
+                    ? $this->CreatePeriodEntry($bounds, $currentValue, $now)
+                    : $this->CreatePeriodEntry($bounds, $carry, $bounds[0]);
                 $changed = true;
             }
         }
@@ -1250,7 +1344,6 @@ class PeriodicStatistics extends IPSModuleStrict
     // Applies one sample to the given periods in memory. Returns true if published data changed.
     private function ApplyValue(array &$variableState, int $variableID, array $definitions, float $value, int $timestamp, bool $allowRollover): bool
     {
-        $averageType = $this->GetAverageType($variableID);
         $value = $this->NormalizeValue($variableID, $value);
         // The value valid before this sample seeds a period that started in between.
         $carry = $variableState['last']['value'] ?? $value;
@@ -1260,20 +1353,20 @@ class PeriodicStatistics extends IPSModuleStrict
             if ($bounds === null) {
                 continue;
             }
-            $name = $period['key'];
-            $entry = $variableState['periods'][$name] ?? null;
+            $periodKey = $period['key'];
+            $entry = $variableState['periods'][$periodKey] ?? null;
             $entryStart = is_array($entry) ? (int) ($entry['periodStart'] ?? -1) : -1;
             if ($entryStart !== $bounds[0]) {
                 // Never fall back to an older period.
                 if (!$allowRollover || $entryStart > $bounds[0]) {
                     continue;
                 }
-                $variableState['periods'][$name] = $period['type'] === 'alltime'
-                    ? $this->CreatePeriodEntry($bounds, $value, $timestamp, $averageType)
-                    : $this->CreatePeriodEntry($bounds, $carry, $bounds[0], $averageType);
+                $variableState['periods'][$periodKey] = $period['type'] === 'alltime'
+                    ? $this->CreatePeriodEntry($bounds, $value, $timestamp)
+                    : $this->CreatePeriodEntry($bounds, $carry, $bounds[0]);
                 $changed = true;
             }
-            if ($this->UpdatePeriodEntry($variableState['periods'][$name], $averageType, $value, $timestamp)) {
+            if ($this->UpdatePeriodEntry($variableState['periods'][$periodKey], $value, $timestamp)) {
                 $changed = true;
             }
         }
@@ -1289,33 +1382,57 @@ class PeriodicStatistics extends IPSModuleStrict
 
     // A new period starts with the value that is valid at its beginning.
     // Its timestamp is the period boundary, even if the rollover is noticed later.
-    private function CreatePeriodEntry(array $bounds, $value, int $timestamp, string $averageType): array
+    private function CreatePeriodEntry(array $bounds, $value, int $timestamp): array
     {
         return [
             'periodStart' => $bounds[0],
             'periodEnd' => $bounds[1],
             'min' => ['value' => $value, 'timestamp' => $timestamp],
-            'max' => ['value' => $value, 'timestamp' => $timestamp],
-            'averageType' => $averageType,
-            'average' => $this->CreateAverageState($averageType, $value, $timestamp)
+            'max' => ['value' => $value, 'timestamp' => $timestamp]
+        ] + $this->CreateAggregates($value, $timestamp);
+    }
+
+    // State of the averages, the difference and the integral, starting with the value valid at $timestamp.
+    // The arithmetic average covers the changes within the period; until the first one arrives,
+    // the carried-in value stands in for it. The integral is derived from the time-weighted sum.
+    private function CreateAggregates($value, int $timestamp): array
+    {
+        return [
+            'arithmetic' => ['sum' => 0.0, 'count' => 0, 'carry' => (float) $value],
+            'timeweighted' => ['weightedSum' => 0.0, 'weightedTime' => 0, 'lastValue' => (float) $value, 'lastTimestamp' => $timestamp],
+            'delta' => 0.0
         ];
     }
 
-    private function UpdatePeriodEntry(array &$entry, string $averageType, $value, int $timestamp): bool
+    private function CreateEmptyAggregates(): array
     {
-        $changed = false;
-        if (($entry['averageType'] ?? 'none') !== $averageType) {
-            $entry['averageType'] = $averageType;
-            $entry['average'] = $this->CreateAverageState($averageType, $value, $timestamp);
-            $changed = true;
+        return ['arithmetic' => null, 'timeweighted' => null, 'delta' => null];
+    }
+
+    private function UpdatePeriodEntry(array &$entry, $value, int $timestamp): bool
+    {
+        $this->UpdateExtremes($entry, $value, $timestamp);
+        if (!is_array($entry['arithmetic'] ?? null) || !is_array($entry['timeweighted'] ?? null)) {
+            $entry = array_merge($entry, $this->CreateAggregates($value, $timestamp));
         }
-        if ($this->UpdateExtremes($entry, $value, $timestamp)) {
-            $changed = true;
+
+        $entry['arithmetic']['sum'] = (float) $entry['arithmetic']['sum'] + (float) $value;
+        $entry['arithmetic']['count'] = (int) $entry['arithmetic']['count'] + 1;
+
+        // Out-of-order samples cannot be weighted and are ignored for the time-based values.
+        $timeweighted = &$entry['timeweighted'];
+        if ($timestamp >= (int) $timeweighted['lastTimestamp']) {
+            $previous = (float) $timeweighted['lastValue'];
+            $duration = $timestamp - (int) $timeweighted['lastTimestamp'];
+            $timeweighted['weightedSum'] = (float) $timeweighted['weightedSum'] + $previous * $duration;
+            $timeweighted['weightedTime'] = (int) $timeweighted['weightedTime'] + $duration;
+            // A drop is a counter reset: the new value counts from zero.
+            $entry['delta'] = (float) ($entry['delta'] ?? 0.0) + ((float) $value >= $previous ? (float) $value - $previous : (float) $value);
+            $timeweighted['lastValue'] = (float) $value;
+            $timeweighted['lastTimestamp'] = $timestamp;
         }
-        if ($this->UpdateAverageState($entry, $averageType, $value, $timestamp)) {
-            $changed = true;
-        }
-        return $changed;
+        unset($timeweighted);
+        return true;
     }
 
     private function UpdateExtremes(array &$entry, $value, int $timestamp): bool
@@ -1334,53 +1451,23 @@ class PeriodicStatistics extends IPSModuleStrict
 
     private function GetPeriodBounds(array $period, int $timestamp): ?array
     {
-        if (($period['kind'] ?? '') === 'custom') {
-            return $this->GetCustomPeriodBounds($period, $timestamp);
+        if ($period['kind'] === 'alltime') {
+            // Zero is a stable identity for the lifetime period, not a measured timestamp.
+            return [0, 2147483647];
         }
+        return $this->GetCustomPeriodBounds($period, $timestamp);
+    }
 
-        $timezone = new DateTimeZone(date_default_timezone_get());
-        $moment = (new DateTimeImmutable('@' . $timestamp))->setTimezone($timezone);
-
-        switch ($period['type']) {
-            case 'alltime':
-                // Zero is a stable identity for the lifetime period, not a measured timestamp.
-                return [0, 2147483647];
-
-            case 'daily':
-                $start = $moment->setTime(0, 0, 0);
-                $end = $start->modify('+1 day');
-                break;
-
-            case 'weekly':
-                $currentWeekday = (int) $moment->format('w');
-                $daysBack = ($currentWeekday - $period['weekday'] + 7) % 7;
-                $start = $moment->modify('-' . $daysBack . ' days')->setTime(0, 0, 0);
-                $end = $start->modify('+7 days');
-                break;
-
-            case 'monthly':
-                $start = $moment->setDate((int) $moment->format('Y'), (int) $moment->format('n'), 1)->setTime(0, 0, 0);
-                $end = $start->modify('+1 month');
-                break;
-
-            case 'yearly':
-                $start = $moment->setDate((int) $moment->format('Y'), 1, 1)->setTime(0, 0, 0);
-                $end = $start->modify('+1 year');
-                break;
-
-            default:
-                throw new RuntimeException('Unsupported period type.');
-        }
-
-        return [$start->getTimestamp(), $end->getTimestamp()];
+    private function GetCustomAnchor(array $period): DateTimeImmutable
+    {
+        return (new DateTimeImmutable('now', new DateTimeZone(date_default_timezone_get())))
+            ->setDate($period['startYear'], $period['startMonth'], $period['startDay'])
+            ->setTime(0, 0, 0);
     }
 
     private function GetCustomPeriodBounds(array $period, int $timestamp): ?array
     {
-        $timezone = new DateTimeZone(date_default_timezone_get());
-        $anchor = (new DateTimeImmutable('now', $timezone))
-            ->setDate($period['startYear'], $period['startMonth'], $period['startDay'])
-            ->setTime(0, 0, 0);
+        $anchor = $this->GetCustomAnchor($period);
         $anchorTimestamp = $anchor->getTimestamp();
 
         if ($timestamp < $anchorTimestamp) {
@@ -1399,7 +1486,7 @@ class PeriodicStatistics extends IPSModuleStrict
             case 'day':
             case 'week':
                 $daysPerPeriod = $period['duration'] * ($period['type'] === 'week' ? 7 : 1);
-                $moment = (new DateTimeImmutable('@' . $timestamp))->setTimezone($timezone)->setTime(0, 0, 0);
+                $moment = (new DateTimeImmutable('@' . $timestamp))->setTimezone($anchor->getTimezone())->setTime(0, 0, 0);
                 $daysSinceAnchor = (int) $anchor->diff($moment)->format('%a');
                 $index = intdiv($daysSinceAnchor, $daysPerPeriod);
                 $start = $anchor->modify('+' . ($index * $daysPerPeriod) . ' days');
@@ -1524,118 +1611,95 @@ class PeriodicStatistics extends IPSModuleStrict
 
         $public = [
             'VariableID' => $variableID,
-            'Data' => $this->CreatePublicData($variableState, $variableID)
+            'Data' => $this->CreatePublicData($variableState)
         ];
         $json = json_encode($public, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION);
         $this->SetValue($ident, $json);
+
+        $this->PublishIndividualVariables($variableID, $variableState);
     }
 
-    private function CreatePublicData(array $variableState, int $variableID): array
+    // Writes only changed values; empty statistics leave the variable untouched.
+    private function PublishIndividualVariables(int $variableID, array $variableState): void
+    {
+        foreach ($this->GetIndividualTargets($variableID) as $ident => $target) {
+            $entry = $variableState['periods'][$target['periodKey']] ?? null;
+            $objectID = @$this->GetIDForIdent($ident);
+            if ($entry === null || $objectID === false) {
+                continue;
+            }
+            $values = $this->CalculateValues($entry);
+            switch ($target['metric']) {
+                case 'mintime':
+                    $value = $entry['min']['timestamp'] ?? null;
+                    break;
+                case 'maxtime':
+                    $value = $entry['max']['timestamp'] ?? null;
+                    break;
+                case 'min':
+                case 'max':
+                    $value = $entry[$target['metric']]['value'] ?? null;
+                    break;
+                default:
+                    $value = $values[['avga' => 'avgArithmetic', 'avgt' => 'avgTimeWeighted', 'delta' => 'delta', 'integral' => 'integral'][$target['metric']]];
+            }
+            if ($value === null) {
+                continue;
+            }
+            $value = $target['type'] === VARIABLETYPE_FLOAT ? (float) $value : (int) round((float) $value);
+            if (GetValue($objectID) !== $value) {
+                $this->SetValue($ident, $value);
+            }
+        }
+    }
+
+    private function CreatePublicData(array $variableState): array
     {
         $result = [];
-        $averageType = $this->GetAverageType($variableID);
         foreach ($this->GetPeriodDefinitions() as $period) {
             $entry = $variableState['periods'][$period['key']] ?? null;
             if ($entry === null) {
                 continue;
             }
-            $periodData = [
+            $result[$period['name']] = [
                 'min' => $entry['min'] ?? null,
                 'max' => $entry['max'] ?? null
-            ];
-            if ($averageType !== 'none') {
-                $periodData['avg'] = $this->CalculateAverage($entry, $averageType);
-            }
-            $result[$period['name']] = $periodData;
+            ] + $this->CalculateValues($entry);
         }
         return $result;
     }
 
-    private function GetAverageType(int $variableID): string
+    // Averages, difference and integral (value × hours) of a period, up to now or its end.
+    private function CalculateValues(array $entry): array
     {
-        foreach ($this->GetConfiguredVariables() as $row) {
-            if ((int) ($row['Variable'] ?? 0) === $variableID) {
-                $type = strtolower((string) ($row['Average'] ?? 'none'));
-                return in_array($type, ['none', 'arithmetic', 'timeweighted'], true) ? $type : 'none';
+        $result = ['avgArithmetic' => null, 'avgTimeWeighted' => null, 'delta' => null, 'integral' => null];
+
+        $arithmetic = $entry['arithmetic'] ?? null;
+        if (is_array($arithmetic)) {
+            $count = (int) $arithmetic['count'];
+            $result['avgArithmetic'] = $count > 0
+                ? (float) $arithmetic['sum'] / $count
+                : (isset($arithmetic['carry']) ? (float) $arithmetic['carry'] : null);
+        }
+
+        $timeweighted = $entry['timeweighted'] ?? null;
+        if (is_array($timeweighted)) {
+            $weightedSum = (float) $timeweighted['weightedSum'];
+            $weightedTime = (int) $timeweighted['weightedTime'];
+            $lastTimestamp = (int) $timeweighted['lastTimestamp'];
+            $end = min(time(), (int) $entry['periodEnd']);
+            if ($end > $lastTimestamp) {
+                $weightedSum += (float) $timeweighted['lastValue'] * ($end - $lastTimestamp);
+                $weightedTime += $end - $lastTimestamp;
             }
-        }
-        return 'none';
-    }
-
-    // The arithmetic average covers the samples within the period. Until the first one
-    // arrives, the value carried in at the period start stands in for it.
-    private function CreateAverageState(string $type, $value, int $timestamp): ?array
-    {
-        if ($type === 'arithmetic') {
-            return ['sum' => 0.0, 'count' => 0, 'carry' => (float) $value];
-        }
-        if ($type === 'timeweighted') {
-            return [
-                'weightedSum' => 0.0,
-                'weightedTime' => 0,
-                'lastValue' => (float) $value,
-                'lastTimestamp' => $timestamp
-            ];
-        }
-        return null;
-    }
-
-    private function UpdateAverageState(array &$entry, string $type, $value, int $timestamp): bool
-    {
-        if ($type === 'none') {
-            return false;
-        }
-        if (!isset($entry['average']) || !is_array($entry['average'])) {
-            $entry['average'] = $this->CreateAverageState($type, $value, $timestamp);
+            $result['avgTimeWeighted'] = $weightedTime > 0 ? $weightedSum / $weightedTime : (float) $timeweighted['lastValue'];
+            $result['integral'] = $weightedSum / 3600;
         }
 
-        if ($type === 'arithmetic') {
-            $entry['average']['sum'] = (float) ($entry['average']['sum'] ?? 0.0) + (float) $value;
-            $entry['average']['count'] = (int) ($entry['average']['count'] ?? 0) + 1;
-            return true;
+        if (isset($entry['delta'])) {
+            $result['delta'] = (float) $entry['delta'];
         }
-
-        $lastTimestamp = (int) ($entry['average']['lastTimestamp'] ?? $timestamp);
-        if ($timestamp < $lastTimestamp) {
-            return false;
-        }
-        $duration = $timestamp - $lastTimestamp;
-        if ($duration > 0) {
-            $entry['average']['weightedSum'] = (float) ($entry['average']['weightedSum'] ?? 0.0)
-                + (float) ($entry['average']['lastValue'] ?? $value) * $duration;
-            $entry['average']['weightedTime'] = (int) ($entry['average']['weightedTime'] ?? 0) + $duration;
-        }
-        $entry['average']['lastValue'] = (float) $value;
-        $entry['average']['lastTimestamp'] = $timestamp;
-        return true;
-    }
-
-    private function CalculateAverage(array $entry, string $type): ?float
-    {
-        $average = $entry['average'] ?? null;
-        if (!is_array($average)) {
-            return null;
-        }
-        if ($type === 'arithmetic') {
-            $count = (int) ($average['count'] ?? 0);
-            if ($count > 0) {
-                return (float) $average['sum'] / $count;
-            }
-            return isset($average['carry']) ? (float) $average['carry'] : null;
-        }
-        if ($type === 'timeweighted') {
-            $weightedSum = (float) ($average['weightedSum'] ?? 0.0);
-            $weightedTime = (int) ($average['weightedTime'] ?? 0);
-            $lastTimestamp = (int) ($average['lastTimestamp'] ?? 0);
-            $end = min(time(), (int) ($entry['periodEnd'] ?? time()));
-            if ($lastTimestamp > 0 && $end > $lastTimestamp) {
-                $duration = $end - $lastTimestamp;
-                $weightedSum += (float) ($average['lastValue'] ?? 0.0) * $duration;
-                $weightedTime += $duration;
-            }
-            return $weightedTime > 0 ? $weightedSum / $weightedTime : (isset($average['lastValue']) ? (float) $average['lastValue'] : null);
-        }
-        return null;
+        return $result;
     }
 
     private function ScheduleNextRollover(): void
@@ -1671,16 +1735,7 @@ class PeriodicStatistics extends IPSModuleStrict
     private function ReadState(): array
     {
         $state = json_decode($this->ReadAttributeString('State'), true);
-        if (!is_array($state)) {
-            return [];
-        }
-        foreach ($state as $key => $variableState) {
-            if (is_array($variableState) && !array_key_exists('periods', $variableState)) {
-                // Earlier builds kept the periods directly below the variable.
-                $state[$key] = ['periods' => $variableState];
-            }
-        }
-        return $state;
+        return is_array($state) ? $state : [];
     }
 
     private function WriteState(array $state): void
