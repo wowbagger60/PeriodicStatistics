@@ -47,6 +47,7 @@ class PeriodicStatistics extends IPSModuleStrict
         $this->RegisterAttributeString('MergeJobs', '{}');
         $this->RegisterAttributeString('MergeQueue', '[]');
         $this->RegisterAttributeString('GeneratedNames', '{}');
+        $this->RegisterAttributeString('TimeWindowIDs', '[]');
     }
 
     public function ApplyChanges(): void
@@ -1037,6 +1038,8 @@ class PeriodicStatistics extends IPSModuleStrict
     }
 
     // Gives every time window a unique, immutable ID. Returns true if the configuration was rewritten.
+    // A row that lost its ID gets back the previous ID of the window with the same name, so a
+    // dropped ID column cannot discard statistics and individual variables.
     private function EnsureTimeWindowIDs(): bool
     {
         $rows = json_decode($this->ReadPropertyString('TimeWindows'), true);
@@ -1044,22 +1047,44 @@ class PeriodicStatistics extends IPSModuleStrict
             return false;
         }
 
+        $previous = json_decode($this->ReadAttributeString('TimeWindowIDs'), true);
+        $previous = is_array($previous) ? $previous : [];
+        $used = [];
+        foreach ($rows as $row) {
+            $id = (string) ($row['ID'] ?? '');
+            if (preg_match(self::TIME_WINDOW_ID_PATTERN, $id) === 1) {
+                $used[$id] = ($used[$id] ?? 0) + 1;
+            }
+        }
+
         $seen = [];
         $changed = false;
         foreach ($rows as &$row) {
             $id = (string) ($row['ID'] ?? '');
             if (preg_match(self::TIME_WINDOW_ID_PATTERN, $id) !== 1 || isset($seen[$id])) {
-                $id = 'tw_' . bin2hex(random_bytes(6));
-                $row['ID'] = $id;
+                $id = '';
+                foreach ($previous as $known) {
+                    if ($known['name'] === trim((string) ($row['Name'] ?? '')) && !isset($used[$known['id']]) && !isset($seen[$known['id']])) {
+                        $id = $known['id'];
+                        break;
+                    }
+                }
+                $row['ID'] = $id !== '' ? $id : 'tw_' . bin2hex(random_bytes(6));
+                $id = $row['ID'];
                 $changed = true;
             }
             $seen[$id] = true;
         }
         unset($row);
+
+        $this->WriteAttributeString('TimeWindowIDs', json_encode(array_map(static fn($row) => [
+            'id' => $row['ID'], 'name' => trim((string) ($row['Name'] ?? ''))
+        ], $rows), JSON_UNESCAPED_UNICODE));
         if (!$changed) {
             return false;
         }
 
+        $this->SendDebug('TimeWindows', 'Assigned missing time window IDs.', 0);
         IPS_SetProperty($this->InstanceID, 'TimeWindows', json_encode($rows));
         IPS_ApplyChanges($this->InstanceID);
         return true;
