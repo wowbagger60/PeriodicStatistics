@@ -1,0 +1,14 @@
+{
+    "id": "{A7E9D3BB-7351-4A1B-9187-3B1CEC4B5C50}",
+    "name": "PeriodicStatistics",
+    "type": 3,
+    "vendor": "Cassanis Automation",
+    "aliases": [
+        "Periodic Statistics"
+    ],
+    "url": "https://github.com/wowbagger60/PeriodicStatistics",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": [],
+    "prefix": "PERST"
+}

@@ -1,0 +1,191 @@
+{
+    "elements": [
+        {
+            "type": "Select",
+            "name": "FirstDayOfWeek",
+            "caption": "First day of week",
+            "options": [
+                {
+                    "caption": "Sunday",
+                    "value": 0
+                },
+                {
+                    "caption": "Monday",
+                    "value": 1
+                },
+                {
+                    "caption": "Tuesday",
+                    "value": 2
+                },
+                {
+                    "caption": "Wednesday",
+                    "value": 3
+                },
+                {
+                    "caption": "Thursday",
+                    "value": 4
+                },
+                {
+                    "caption": "Friday",
+                    "value": 5
+                },
+                {
+                    "caption": "Saturday",
+                    "value": 6
+                }
+            ]
+        },
+        {
+            "type": "NumberSpinner",
+            "name": "RefreshInterval",
+            "caption": "Refresh interval for time-weighted averages",
+            "suffix": " min",
+            "minimum": 0
+        },
+        {
+            "type": "List",
+            "name": "Variables",
+            "caption": "Variables",
+            "rowCount": 10,
+            "add": true,
+            "delete": true,
+            "columns": [
+                {
+                    "name": "Variable",
+                    "caption": "Variable",
+                    "width": "auto",
+                    "add": 0,
+                    "edit": {
+                        "type": "SelectVariable"
+                    }
+                },
+                {
+                    "name": "Average",
+                    "caption": "Average",
+                    "width": "160px",
+                    "add": "none",
+                    "edit": {
+                        "type": "Select",
+                        "options": [
+                            {
+                                "caption": "None",
+                                "value": "none"
+                            },
+                            {
+                                "caption": "Arithmetic",
+                                "value": "arithmetic"
+                            },
+                            {
+                                "caption": "Time weighted",
+                                "value": "timeweighted"
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "type": "List",
+            "name": "TimeWindows",
+            "caption": "Custom time windows",
+            "rowCount": 6,
+            "add": true,
+            "delete": true,
+            "columns": [
+                {
+                    "name": "ID",
+                    "caption": "ID",
+                    "width": "0px",
+                    "visible": false,
+                    "add": ""
+                },
+                {
+                    "name": "Name",
+                    "caption": "Name",
+                    "width": "190px",
+                    "add": "Custom",
+                    "edit": {
+                        "type": "ValidationTextBox"
+                    }
+                },
+                {
+                    "name": "Start",
+                    "caption": "Start date",
+                    "width": "160px",
+                    "add": {
+                        "day": 0,
+                        "month": 0,
+                        "year": 0
+                    },
+                    "edit": {
+                        "type": "SelectDate"
+                    }
+                },
+                {
+                    "name": "Duration",
+                    "caption": "Duration",
+                    "width": "100px",
+                    "add": 1,
+                    "edit": {
+                        "type": "NumberSpinner",
+                        "minimum": 1
+                    }
+                },
+                {
+                    "name": "Unit",
+                    "caption": "Unit",
+                    "width": "120px",
+                    "add": "year",
+                    "edit": {
+                        "type": "Select",
+                        "options": [
+                            {
+                                "caption": "Day(s)",
+                                "value": "day"
+                            },
+                            {
+                                "caption": "Week(s)",
+                                "value": "week"
+                            },
+                            {
+                                "caption": "Month(s)",
+                                "value": "month"
+                            },
+                            {
+                                "caption": "Year(s)",
+                                "value": "year"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "name": "Repeat",
+                    "caption": "Repeat",
+                    "width": "100px",
+                    "add": true,
+                    "edit": {
+                        "type": "CheckBox"
+                    }
+                }
+            ]
+        }
+    ],
+    "actions": [],
+    "status": [
+        {
+            "code": 102,
+            "icon": "active",
+            "caption": "Instance active."
+        },
+        {
+            "code": 201,
+            "icon": "error",
+            "caption": "Configuration invalid."
+        },
+        {
+            "code": 202,
+            "icon": "error",
+            "caption": "A configured variable does not exist."
+        }
+    ]
+}
