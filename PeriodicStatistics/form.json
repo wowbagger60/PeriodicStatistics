@@ -10,7 +10,7 @@
         {
             "type": "List",
             "name": "Variables",
-            "caption": "Variables (all values are always calculated; ticked values are also created as individual variables)",
+            "caption": "Variables",
             "rowCount": 10,
             "add": true,
             "delete": true,
@@ -86,6 +86,52 @@
                     "edit": {
                         "type": "CheckBox"
                     }
+                }
+            ],
+            "form": [
+                {
+                    "type": "SelectVariable",
+                    "name": "Variable",
+                    "caption": "Variable"
+                },
+                {
+                    "type": "Label",
+                    "caption": "All values are always calculated and stored in the JSON variable. Select which values are additionally created as individual variables:"
+                },
+                {
+                    "type": "CheckBox",
+                    "name": "Min",
+                    "caption": "Minimum"
+                },
+                {
+                    "type": "CheckBox",
+                    "name": "Max",
+                    "caption": "Maximum"
+                },
+                {
+                    "type": "CheckBox",
+                    "name": "AvgArithmetic",
+                    "caption": "Average (arithmetic)"
+                },
+                {
+                    "type": "CheckBox",
+                    "name": "AvgTimeWeighted",
+                    "caption": "Average (time-weighted)"
+                },
+                {
+                    "type": "CheckBox",
+                    "name": "Delta",
+                    "caption": "Difference"
+                },
+                {
+                    "type": "CheckBox",
+                    "name": "Integral",
+                    "caption": "Integral"
+                },
+                {
+                    "type": "CheckBox",
+                    "name": "Timestamps",
+                    "caption": "Times of minimum and maximum"
                 }
             ]
         },
@@ -199,7 +245,66 @@
             "caption": "Individual variables currently created: %d"
         }
     ],
-    "actions": [],
+    "actions": [
+        {
+            "type": "Select",
+            "name": "RebuildVariable",
+            "caption": "Variable",
+            "value": 0,
+            "options": []
+        },
+        {
+            "type": "Button",
+            "caption": "Rebuild from archive",
+            "confirm": "The statistics of the selected variables are replaced by values calculated from the archive. Continue?",
+            "onClick": "IPS_RequestAction($id, 'Rebuild', $RebuildVariable);"
+        },
+        {
+            "type": "PopupAlert",
+            "name": "RebuildResult",
+            "visible": false,
+            "popup": {
+                "items": [
+                    {
+                        "type": "Label",
+                        "name": "RebuildResultText",
+                        "caption": ""
+                    }
+                ]
+            }
+        },
+        {
+            "type": "List",
+            "name": "Jobs",
+            "caption": "Archive jobs (completed jobs are removed after one hour)",
+            "rowCount": 5,
+            "add": false,
+            "delete": false,
+            "columns": [
+                {
+                    "name": "Variable",
+                    "caption": "Variable",
+                    "width": "auto"
+                },
+                {
+                    "name": "Status",
+                    "caption": "Status",
+                    "width": "120px"
+                },
+                {
+                    "name": "Processed",
+                    "caption": "Records",
+                    "width": "110px"
+                },
+                {
+                    "name": "Message",
+                    "caption": "Message",
+                    "width": "350px"
+                }
+            ],
+            "values": []
+        }
+    ],
     "status": [
         {
             "code": 102,

@@ -5,7 +5,7 @@ class PeriodicStatistics extends IPSModuleStrict
     private const STATUS_INVALID_CONFIGURATION = 201;
     private const STATUS_MISSING_VARIABLE = 202;
     private const TIMER_ROLLOVER = 'Rollover';
-    private const TIMER_MERGE = 'ArchiveMerge';
+    private const TIMER_ARCHIVE = 'ArchiveRebuild';
     private const TIMER_REFRESH = 'Refresh';
     private const ARCHIVE_PAGE_SIZE = 5000;
     private const LOCK_TIMEOUT = 30000;
@@ -38,14 +38,14 @@ class PeriodicStatistics extends IPSModuleStrict
         $this->RegisterPropertyBoolean('IndividualAlltime', false);
 
         $this->RegisterTimer(self::TIMER_ROLLOVER, 0, 'PERST_InternalTimer($_IPS[\'TARGET\']);');
-        $this->RegisterTimer(self::TIMER_MERGE, 0, 'PERST_InternalMergeTimer($_IPS[\'TARGET\']);');
+        $this->RegisterTimer(self::TIMER_ARCHIVE, 0, 'PERST_InternalArchiveTimer($_IPS[\'TARGET\']);');
         $this->RegisterTimer(self::TIMER_REFRESH, 0, 'PERST_InternalRefreshTimer($_IPS[\'TARGET\']);');
 
         $this->RegisterAttributeString('RegisteredVariables', '[]');
         $this->RegisterAttributeString('State', '{}');
         $this->RegisterAttributeString('ConfigurationError', '');
-        $this->RegisterAttributeString('MergeJobs', '{}');
-        $this->RegisterAttributeString('MergeQueue', '[]');
+        $this->RegisterAttributeString('ArchiveJobs', '{}');
+        $this->RegisterAttributeString('ArchiveQueue', '[]');
         $this->RegisterAttributeString('GeneratedNames', '{}');
         $this->RegisterAttributeString('TimeWindowIDs', '[]');
     }
@@ -77,6 +77,17 @@ class PeriodicStatistics extends IPSModuleStrict
             }
         }
 
+        foreach ($form['actions'] as $index => $action) {
+            switch ($action['name'] ?? '') {
+                case 'RebuildVariable':
+                    $form['actions'][$index]['options'] = $this->GetRebuildOptions();
+                    break;
+                case 'Jobs':
+                    $form['actions'][$index]['values'] = $this->GetJobListValues();
+                    break;
+            }
+        }
+
         $error = $this->ReadConfigurationError();
         if ($error !== '') {
             array_unshift($form['elements'], [
@@ -86,6 +97,16 @@ class PeriodicStatistics extends IPSModuleStrict
         }
 
         return json_encode($form);
+    }
+
+    public function RequestAction(string $Ident, mixed $Value): void
+    {
+        switch ($Ident) {
+            case 'Rebuild':
+                $this->RebuildFromForm((int) $Value);
+                return;
+        }
+        throw new InvalidArgumentException('Unknown action.');
     }
 
     public function MessageSink($TimeStamp, $SenderID, $Message, $Data): void
@@ -255,21 +276,16 @@ class PeriodicStatistics extends IPSModuleStrict
         });
     }
 
-    // Archive import is asynchronous. Jobs survive timer ticks and Symcon restarts,
+    // Archive rebuilds are asynchronous. Jobs survive timer ticks and Symcon restarts,
     // but applying the configuration aborts them.
-    public function MergeFromArchive(int $VariableID): string
-    {
-        return $this->StartArchiveJob($VariableID, false);
-    }
-
     public function RebuildFromArchive(int $VariableID): string
     {
-        return $this->StartArchiveJob($VariableID, true);
+        return $this->StartArchiveJob($VariableID);
     }
 
     public function GetJobStatus(string $Token): array
     {
-        $jobs = $this->ReadMergeJobs();
+        $jobs = $this->ReadArchiveJobs();
         if (!isset($jobs[$Token])) {
             return ['status' => 'unknown', 'variable' => 0, 'processed' => 0, 'message' => ''];
         }
@@ -279,22 +295,22 @@ class PeriodicStatistics extends IPSModuleStrict
     public function GetJobs(): array
     {
         $result = [];
-        foreach ($this->ReadMergeJobs() as $token => $job) {
+        foreach ($this->ReadArchiveJobs() as $token => $job) {
             $result[] = $this->PublicJob((string) $token, $job);
         }
         return $result;
     }
 
-    public function InternalMergeTimer(): void
+    public function InternalArchiveTimer(): void
     {
         $work = $this->WithLock(function (): ?array {
-            $jobs = $this->ReadMergeJobs();
+            $jobs = $this->ReadArchiveJobs();
             foreach ($jobs as $token => $job) {
                 if (in_array($job['status'], ['finished', 'failed'], true) && time() - ($job['completed'] ?? time()) > 3600) {
                     unset($jobs[$token]);
                 }
             }
-            $queue = $this->ReadMergeQueue();
+            $queue = $this->ReadArchiveQueue();
             while (count($queue) > 0 && !isset($jobs[$queue[0]])) {
                 array_shift($queue);
             }
@@ -302,10 +318,10 @@ class PeriodicStatistics extends IPSModuleStrict
             if ($token !== null) {
                 $jobs[$token]['status'] = 'running';
             }
-            $this->WriteMergeJobs($jobs);
-            $this->WriteMergeQueue($queue);
+            $this->WriteArchiveJobs($jobs);
+            $this->WriteArchiveQueue($queue);
             if ($token === null) {
-                $this->SetTimerInterval(self::TIMER_MERGE, 0);
+                $this->SetTimerInterval(self::TIMER_ARCHIVE, 0);
                 return null;
             }
             return ['token' => $token, 'job' => $jobs[$token]];
@@ -326,7 +342,7 @@ class PeriodicStatistics extends IPSModuleStrict
 
         $this->WithLock(function () use ($work, $job, $done, $error): void {
             $token = $work['token'];
-            $jobs = $this->ReadMergeJobs();
+            $jobs = $this->ReadArchiveJobs();
             $current = $jobs[$token] ?? null;
             // Discard the page if the job was aborted or another timer run advanced it meanwhile.
             if ($current === null || $current['status'] !== 'running'
@@ -348,20 +364,87 @@ class PeriodicStatistics extends IPSModuleStrict
                 $current['status'] = 'failed';
                 $current['message'] = $error->getMessage();
                 $this->ReplayFailedRebuild($current);
-                $this->SendDebug('ArchiveMerge', $error->getMessage(), 0);
+                $this->SendDebug('ArchiveRebuild', $error->getMessage(), 0);
             }
             if ($current['status'] !== 'running') {
                 $current['completed'] = time();
                 $current['live'] = [];
-                $this->WriteMergeQueue(array_values(array_filter(
-                    $this->ReadMergeQueue(),
+                $this->WriteArchiveQueue(array_values(array_filter(
+                    $this->ReadArchiveQueue(),
                     static fn($queued) => $queued !== $token
                 )));
             }
             $jobs[$token] = $current;
-            $this->WriteMergeJobs($jobs);
-            $this->SetTimerInterval(self::TIMER_MERGE, count($this->ReadMergeQueue()) > 0 ? 1000 : 0);
+            $this->WriteArchiveJobs($jobs);
+            $this->SetTimerInterval(self::TIMER_ARCHIVE, count($this->ReadArchiveQueue()) > 0 ? 1000 : 0);
         });
+        $this->UpdateJobList();
+    }
+
+    // Starts rebuilds for one or, with 0, all configured variables and reports the result in a popup.
+    private function RebuildFromForm(int $variableID): void
+    {
+        $variableIDs = $variableID === 0 ? $this->GetActiveVariableIDs() : [$variableID];
+        if (count($variableIDs) === 0) {
+            $this->ShowRebuildResult($this->Translate('No variable to rebuild.'));
+            return;
+        }
+        $started = 0;
+        $errors = [];
+        foreach ($variableIDs as $id) {
+            try {
+                $this->StartArchiveJob($id);
+                ++$started;
+            } catch (Throwable $exception) {
+                $errors[] = $this->GetVariableCaption($id) . ': ' . $this->Translate($exception->getMessage());
+            }
+        }
+        $message = sprintf($this->Translate('Rebuild started for %d variable(s).'), $started);
+        if (count($errors) > 0) {
+            $message .= "\n\n" . $this->Translate('Not started:') . "\n" . implode("\n", $errors);
+        }
+        $this->ShowRebuildResult($message);
+    }
+
+    // An echo from RequestAction appears as an error with file and line, so the form shows a popup instead.
+    private function ShowRebuildResult(string $message): void
+    {
+        $this->UpdateFormField('RebuildResultText', 'caption', $message);
+        $this->UpdateFormField('RebuildResult', 'visible', true);
+    }
+
+    private function GetRebuildOptions(): array
+    {
+        $options = [['caption' => $this->Translate('All variables'), 'value' => 0]];
+        foreach ($this->GetActiveVariableIDs() as $variableID) {
+            $options[] = ['caption' => $this->GetVariableCaption($variableID), 'value' => $variableID];
+        }
+        return $options;
+    }
+
+    private function GetJobListValues(): array
+    {
+        $values = [];
+        foreach ($this->ReadArchiveJobs() as $job) {
+            $values[] = [
+                'Variable'  => $this->GetVariableCaption((int) $job['variable']),
+                'Status'    => $this->Translate(ucfirst((string) $job['status'])),
+                'Processed' => (int) $job['processed'],
+                'Message'   => $job['message'] !== '' ? $this->Translate((string) $job['message']) : ''
+            ];
+        }
+        return $values;
+    }
+
+    // Refreshes the job list of an open configuration form.
+    private function UpdateJobList(): void
+    {
+        $this->UpdateFormField('Jobs', 'values', json_encode($this->GetJobListValues()));
+    }
+
+    private function GetVariableCaption(int $variableID): string
+    {
+        return IPS_VariableExists($variableID) ? sprintf('%s (%d)', IPS_GetLocation($variableID), $variableID) : (string) $variableID;
     }
 
     private function Initialize(bool $abortJobs): void
@@ -381,7 +464,7 @@ class PeriodicStatistics extends IPSModuleStrict
         if ($error !== null && $error['fatal']) {
             $this->SetTimerInterval(self::TIMER_ROLLOVER, 0);
             $this->SetTimerInterval(self::TIMER_REFRESH, 0);
-            $this->SetTimerInterval(self::TIMER_MERGE, 0);
+            $this->SetTimerInterval(self::TIMER_ARCHIVE, 0);
             $this->SetStatus(self::STATUS_INVALID_CONFIGURATION);
             return;
         }
@@ -394,7 +477,7 @@ class PeriodicStatistics extends IPSModuleStrict
         });
         $this->ScheduleNextRollover();
         $this->UpdateRefreshTimer($variableIDs);
-        $this->SetTimerInterval(self::TIMER_MERGE, count($this->ReadMergeQueue()) > 0 ? 1000 : 0);
+        $this->SetTimerInterval(self::TIMER_ARCHIVE, count($this->ReadArchiveQueue()) > 0 ? 1000 : 0);
 
         $this->SetStatus($error === null ? IS_ACTIVE : self::STATUS_MISSING_VARIABLE);
     }
@@ -417,7 +500,7 @@ class PeriodicStatistics extends IPSModuleStrict
         $value = (float) $data[0];
 
         $this->WithLock(function () use ($variableID, $value, $timestamp): void {
-            if ($this->RecordMergeLiveValue($variableID, $value, $timestamp)) {
+            if ($this->RecordRebuildLiveValue($variableID, $value, $timestamp)) {
                 return;
             }
             $state = $this->ReadState();
@@ -456,9 +539,12 @@ class PeriodicStatistics extends IPSModuleStrict
         $this->SetStatus(self::STATUS_MISSING_VARIABLE);
     }
 
-    private function StartArchiveJob(int $VariableID, bool $rebuild): string
+    private function StartArchiveJob(int $VariableID): string
     {
         $this->EnsureValidSourceVariable($VariableID);
+        if (isset($this->GetRebuildingVariables()[$VariableID])) {
+            throw new RuntimeException('A rebuild is already pending for this variable.');
+        }
         $archives = IPS_GetInstanceListByModuleID('{43192F0B-135B-4CE7-A0A7-1475603F3060}');
         if (count($archives) === 0) {
             throw new RuntimeException('No archive control instance found.');
@@ -487,17 +573,17 @@ class PeriodicStatistics extends IPSModuleStrict
             bin2hex(random_bytes(2)), bin2hex(random_bytes(2)), bin2hex(random_bytes(6)));
         $job = ['status' => 'queued', 'variable' => $VariableID, 'processed' => 0, 'message' => '',
             'archive' => $archiveID, 'start' => $start, 'cursor' => $now, 'cutoff' => $now,
-            'periods' => $periods, 'next' => null, 'newest' => null, 'live' => [], 'created' => $now, 'rebuild' => $rebuild,
-            'type' => $rebuild ? 'rebuild' : 'merge', 'archiveSeen' => []];
+            'periods' => $periods, 'next' => null, 'newest' => null, 'live' => [], 'created' => $now, 'archiveSeen' => []];
         $this->WithLock(function () use ($token, $job): void {
-            $jobs = $this->ReadMergeJobs();
+            $jobs = $this->ReadArchiveJobs();
             $jobs[$token] = $job;
-            $this->WriteMergeJobs($jobs);
-            $queue = $this->ReadMergeQueue();
+            $this->WriteArchiveJobs($jobs);
+            $queue = $this->ReadArchiveQueue();
             $queue[] = $token;
-            $this->WriteMergeQueue($queue);
+            $this->WriteArchiveQueue($queue);
         });
-        $this->SetTimerInterval(self::TIMER_MERGE, 1000);
+        $this->SetTimerInterval(self::TIMER_ARCHIVE, 1000);
+        $this->UpdateJobList();
         return $token;
     }
 
@@ -511,7 +597,7 @@ class PeriodicStatistics extends IPSModuleStrict
 
     private function PublicJob(string $token, array $job): array
     {
-        return ['token' => $token, 'type' => $job['type'],
+        return ['token' => $token,
             'status' => $job['status'], 'variable' => $job['variable'],
             'processed' => $job['processed'], 'message' => $job['message']];
     }
@@ -579,21 +665,11 @@ class PeriodicStatistics extends IPSModuleStrict
             return false;
         }
         // A rebuild must not erase valid statistics when no archive samples exist.
-        if ($job['rebuild'] && $job['processed'] === 0) {
+        if ($job['processed'] === 0) {
             throw new RuntimeException('Archive contains no samples; rebuild was not committed.');
         }
-        // The oldest available value carries back to the beginning of the period that contains it.
-        // A period that ended before the first archived sample gets no synthetic average.
-        if ($job['next'] !== null) {
-            foreach ($job['periods'] as &$period) {
-                $right = min($period['end'], $job['next']['timestamp']);
-                if ($period['start'] !== 0 && !$period['seeded'] && $job['next']['timestamp'] < $period['end'] && $right > $period['start']) {
-                    $period['weightedSum'] += $job['next']['value'] * ($right - $period['start']);
-                    $period['weightedTime'] += $right - $period['start'];
-                }
-            }
-            unset($period);
-        }
+        // Nothing is known before the oldest archived sample: a period that contains it is
+        // weighted from that sample on, a period that ended before it gets no average.
         return true;
     }
 
@@ -623,13 +699,11 @@ class PeriodicStatistics extends IPSModuleStrict
     {
         $variableID = (int) $job['variable'];
         $key = (string) $variableID;
-        $rebuild = (bool) $job['rebuild'];
         $cutoff = (int) $job['cutoff'];
         $definitions = $this->GetPeriodDefinitions();
         $state = $this->ReadState();
         $variableState = $state[$key] ?? ['periods' => []];
         $newestValue = isset($job['newest']) ? (float) $job['newest']['value'] : (float) GetValue($variableID);
-        $aggregatesReplaced = [];
 
         foreach ($job['periods'] as $periodKey => $archive) {
             $entry = $variableState['periods'][$periodKey] ?? null;
@@ -645,23 +719,11 @@ class PeriodicStatistics extends IPSModuleStrict
                 continue; // Do not overwrite a period that rolled over during import.
             }
 
-            if ($rebuild) {
-                // Atomic replacement at commit: deleted archive peaks must not survive.
-                $entry['min'] = $archive['min'];
-                $entry['max'] = $archive['max'];
-            } else {
-                // A seeded period is covered completely by the archive up to the cutoff.
-                foreach (['min', 'max'] as $extreme) {
-                    $candidate = $archive[$extreme];
-                    $old = $archive['seeded'] ? null : ($entry[$extreme] ?? null);
-                    if ($candidate !== null && $this->IsBetterExtreme($extreme, $candidate, $old)) {
-                        $entry[$extreme] = $candidate;
-                    }
-                }
-            }
+            // Atomic replacement at commit: deleted archive peaks must not survive.
+            $entry['min'] = $archive['min'];
+            $entry['max'] = $archive['max'];
 
-            // Archive-derived averages, difference and integral replace the live ones. Without archive
-            // data, a rebuild starts a running period with the newest value and leaves a completed one empty.
+            // Without archive data, a running period starts with the newest value and a completed one stays empty.
             if ($archive['count'] > 0 || $archive['carry'] !== null) {
                 $entry['arithmetic'] = ['sum' => (float) $archive['sum'], 'count' => (int) $archive['count'], 'carry' => $archive['carry']];
                 $entry['timeweighted'] = $archive['weightedTime'] > 0
@@ -669,12 +731,10 @@ class PeriodicStatistics extends IPSModuleStrict
                         'lastValue' => $newestValue, 'lastTimestamp' => $cutoff]
                     : $this->CreateAggregates($newestValue, $cutoff)['timeweighted'];
                 $entry['delta'] = (float) $archive['delta'];
-                $aggregatesReplaced[$periodKey] = true;
-            } elseif ($rebuild) {
+            } else {
                 $entry = array_merge($entry, (int) $archive['end'] > $cutoff
                     ? $this->CreateAggregates($newestValue, $cutoff)
                     : $this->CreateEmptyAggregates());
-                $aggregatesReplaced[$periodKey] = true;
             }
             $variableState['periods'][$periodKey] = $entry;
         }
@@ -696,28 +756,9 @@ class PeriodicStatistics extends IPSModuleStrict
                 --$seen[$signature];
                 continue;
             }
-            if ($rebuild) {
-                // Live updates were withheld during the rebuild and are applied now, including rollovers.
-                $this->ApplyValue($variableState, $variableID, $definitions, $value, $timestamp, true);
-                $this->RememberLastValue($variableState, $variableID, $value, $timestamp);
-                continue;
-            }
-            // A merge processed live updates already. Extremes are idempotent; the other
-            // values need the samples again only where the archive replaced them.
-            $normalized = $this->NormalizeValue($variableID, $value);
-            foreach ($definitions as $definition) {
-                $periodKey = $definition['key'];
-                $bounds = $this->GetPeriodBounds($definition, $timestamp);
-                if ($bounds === null || !isset($variableState['periods'][$periodKey])
-                    || (int) $variableState['periods'][$periodKey]['periodStart'] !== $bounds[0]) {
-                    continue;
-                }
-                if (isset($aggregatesReplaced[$periodKey])) {
-                    $this->UpdatePeriodEntry($variableState['periods'][$periodKey], $normalized, $timestamp);
-                } else {
-                    $this->UpdateExtremes($variableState['periods'][$periodKey], $normalized, $timestamp);
-                }
-            }
+            // Live updates were withheld during the rebuild and are applied now, including rollovers.
+            $this->ApplyValue($variableState, $variableID, $definitions, $value, $timestamp, true);
+            $this->RememberLastValue($variableState, $variableID, $value, $timestamp);
         }
 
         // Periods that rolled over while the rebuild withheld live updates start now.
@@ -733,19 +774,17 @@ class PeriodicStatistics extends IPSModuleStrict
         $this->PublishVariable($variableID, $variableState);
     }
 
-    // Returns true if a rebuild owns the live update; merge jobs only copy it.
-    private function RecordMergeLiveValue(int $variableID, float $value, int $timestamp): bool
+    // Returns true if a pending rebuild withholds the live update.
+    private function RecordRebuildLiveValue(int $variableID, float $value, int $timestamp): bool
     {
-        $jobs = $this->ReadMergeJobs();
+        $jobs = $this->ReadArchiveJobs();
         $changed = false;
         $blocked = false;
         foreach ($jobs as &$job) {
             if ((int) $job['variable'] !== $variableID || !in_array($job['status'], ['queued', 'running'], true)) {
                 continue;
             }
-            if ($job['rebuild']) {
-                $blocked = true;
-            }
+            $blocked = true;
             if ($timestamp >= $job['cutoff']) {
                 $job['live'][] = ['timestamp' => $timestamp, 'value' => $value];
                 $changed = true;
@@ -753,7 +792,7 @@ class PeriodicStatistics extends IPSModuleStrict
         }
         unset($job);
         if ($changed) {
-            $this->WriteMergeJobs($jobs);
+            $this->WriteArchiveJobs($jobs);
         }
         return $blocked;
     }
@@ -761,8 +800,8 @@ class PeriodicStatistics extends IPSModuleStrict
     private function GetRebuildingVariables(): array
     {
         $blocked = [];
-        foreach ($this->ReadMergeJobs() as $job) {
-            if ($job['rebuild'] && in_array($job['status'], ['queued', 'running'], true)) {
+        foreach ($this->ReadArchiveJobs() as $job) {
+            if (in_array($job['status'], ['queued', 'running'], true)) {
                 $blocked[(int) $job['variable']] = true;
             }
         }
@@ -772,7 +811,7 @@ class PeriodicStatistics extends IPSModuleStrict
     private function ReplayFailedRebuild(array $job): void
     {
         $variableID = (int) $job['variable'];
-        if (!$job['rebuild'] || count($job['live']) === 0 || !IPS_VariableExists($variableID)) {
+        if (count($job['live']) === 0 || !IPS_VariableExists($variableID)) {
             return;
         }
         $live = $job['live'];
@@ -794,7 +833,7 @@ class PeriodicStatistics extends IPSModuleStrict
     // Aborts all pending jobs, or only those of one variable.
     private function AbortArchiveJobs(string $reason, int $variableID = 0): void
     {
-        $jobs = $this->ReadMergeJobs();
+        $jobs = $this->ReadArchiveJobs();
         $aborted = [];
         foreach ($jobs as $token => &$job) {
             if (!in_array($job['status'], ['queued', 'running'], true)
@@ -809,41 +848,41 @@ class PeriodicStatistics extends IPSModuleStrict
             $aborted[(string) $token] = true;
         }
         unset($job);
-        $this->WriteMergeJobs($jobs);
+        $this->WriteArchiveJobs($jobs);
 
         $queue = array_values(array_filter(
-            $this->ReadMergeQueue(),
+            $this->ReadArchiveQueue(),
             static fn($token) => !isset($aborted[(string) $token])
         ));
-        $this->WriteMergeQueue($queue);
+        $this->WriteArchiveQueue($queue);
         if (count($queue) === 0) {
-            $this->SetTimerInterval(self::TIMER_MERGE, 0);
+            $this->SetTimerInterval(self::TIMER_ARCHIVE, 0);
         }
     }
 
-    private function ReadMergeJobs(): array
+    private function ReadArchiveJobs(): array
     {
-        $value = json_decode($this->ReadAttributeString('MergeJobs'), true);
+        $value = json_decode($this->ReadAttributeString('ArchiveJobs'), true);
         return is_array($value) ? $value : [];
     }
 
-    private function ReadMergeQueue(): array
+    private function ReadArchiveQueue(): array
     {
-        $value = json_decode($this->ReadAttributeString('MergeQueue'), true);
+        $value = json_decode($this->ReadAttributeString('ArchiveQueue'), true);
         return is_array($value) ? $value : [];
     }
 
-    private function WriteMergeJobs(array $jobs): void
+    private function WriteArchiveJobs(array $jobs): void
     {
-        $this->WriteAttributeString('MergeJobs', json_encode($jobs, JSON_PRESERVE_ZERO_FRACTION));
+        $this->WriteAttributeString('ArchiveJobs', json_encode($jobs, JSON_PRESERVE_ZERO_FRACTION));
     }
 
-    private function WriteMergeQueue(array $queue): void
+    private function WriteArchiveQueue(array $queue): void
     {
-        $this->WriteAttributeString('MergeQueue', json_encode(array_values($queue)));
+        $this->WriteAttributeString('ArchiveQueue', json_encode(array_values($queue)));
     }
 
-    // Serializes all access to State and MergeJobs; Symcon runs messages, timers and calls in parallel.
+    // Serializes all access to State and ArchiveJobs; Symcon runs messages, timers and calls in parallel.
     private function WithLock(callable $callback)
     {
         if ($this->lockDepth === 0 && !IPS_SemaphoreEnter($this->GetLockName(), self::LOCK_TIMEOUT)) {
@@ -1318,6 +1357,7 @@ class PeriodicStatistics extends IPSModuleStrict
         $definitions = $this->GetPeriodDefinitions();
         $state = $this->ReadState();
         $changed = [];
+        $remembered = false;
         foreach ($variableIDs as $variableID) {
             if (isset($blocked[$variableID])) {
                 continue;
@@ -1329,13 +1369,19 @@ class PeriodicStatistics extends IPSModuleStrict
 
             $key = (string) $variableID;
             $variableState = $state[$key] ?? ['periods' => []];
+            // Without history, the current value is known to be valid since its last change.
+            if (!isset($variableState['last'])) {
+                $this->RememberLastValue($variableState, $variableID, (float) $value, min($now, (int) IPS_GetVariable($variableID)['VariableChanged']));
+                $state[$key] = $variableState;
+                $remembered = true;
+            }
             if ($this->EnsureCurrentPeriods($variableState, $variableID, $definitions, (float) $value, $now)) {
                 $state[$key] = $variableState;
                 $changed[] = $variableID;
             }
         }
 
-        if (count($changed) > 0) {
+        if ($remembered || count($changed) > 0) {
             $this->WriteState($state);
             foreach ($changed as $variableID) {
                 $this->PublishVariable($variableID, $state[(string) $variableID]);
@@ -1346,8 +1392,6 @@ class PeriodicStatistics extends IPSModuleStrict
     private function EnsureCurrentPeriods(array &$variableState, int $variableID, array $definitions, float $currentValue, int $now): bool
     {
         $currentValue = $this->NormalizeValue($variableID, $currentValue);
-        // The value valid at a period boundary is the last observed one; without history it is the current value.
-        $carry = $variableState['last']['value'] ?? $currentValue;
         $changed = false;
         foreach ($definitions as $period) {
             $bounds = $this->GetPeriodBounds($period, $now);
@@ -1359,7 +1403,7 @@ class PeriodicStatistics extends IPSModuleStrict
             if (!is_array($entry) || (int) ($entry['periodStart'] ?? -1) !== $bounds[0]) {
                 $variableState['periods'][$periodKey] = $period['type'] === 'alltime'
                     ? $this->CreatePeriodEntry($bounds, $currentValue, $now)
-                    : $this->CreatePeriodEntry($bounds, $carry, $bounds[0]);
+                    : $this->CreateCarriedPeriodEntry($bounds, $variableState, $currentValue, $now);
                 $changed = true;
             }
         }
@@ -1370,8 +1414,6 @@ class PeriodicStatistics extends IPSModuleStrict
     private function ApplyValue(array &$variableState, int $variableID, array $definitions, float $value, int $timestamp, bool $allowRollover): bool
     {
         $value = $this->NormalizeValue($variableID, $value);
-        // The value valid before this sample seeds a period that started in between.
-        $carry = $variableState['last']['value'] ?? $value;
         $changed = false;
         foreach ($definitions as $period) {
             $bounds = $this->GetPeriodBounds($period, $timestamp);
@@ -1388,7 +1430,7 @@ class PeriodicStatistics extends IPSModuleStrict
                 }
                 $variableState['periods'][$periodKey] = $period['type'] === 'alltime'
                     ? $this->CreatePeriodEntry($bounds, $value, $timestamp)
-                    : $this->CreatePeriodEntry($bounds, $carry, $bounds[0]);
+                    : $this->CreateCarriedPeriodEntry($bounds, $variableState, $value, $timestamp);
                 $changed = true;
             }
             if ($this->UpdatePeriodEntry($variableState['periods'][$periodKey], $value, $timestamp)) {
@@ -1403,6 +1445,17 @@ class PeriodicStatistics extends IPSModuleStrict
         if ($timestamp >= (int) ($variableState['last']['timestamp'] ?? 0)) {
             $variableState['last'] = ['value' => $this->NormalizeValue($variableID, $value), 'timestamp' => $timestamp];
         }
+    }
+
+    // The last observed value is valid from the period start, or from its own timestamp if it
+    // arrived later. Without history, nothing is known before the given value and timestamp.
+    private function CreateCarriedPeriodEntry(array $bounds, array $variableState, $value, int $timestamp): array
+    {
+        if (!isset($variableState['last'])) {
+            return $this->CreatePeriodEntry($bounds, $value, $timestamp);
+        }
+        $last = $variableState['last'];
+        return $this->CreatePeriodEntry($bounds, $last['value'], max($bounds[0], min((int) $last['timestamp'], $timestamp)));
     }
 
     // A new period starts with the value that is valid at its beginning.
